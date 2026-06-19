@@ -1,8 +1,10 @@
-const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
-const pino = require('pino');
-require('dotenv').config();
+import express from 'express';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import qrcode from 'qrcode';
+import pino from 'pino';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -16,7 +18,7 @@ let sock = null;
 // Silent logger to reduce memory and noise
 const logger = pino({ level: 'silent' });
 
-async function startWhatsApp() {
+async function connectWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
 
     sock = makeWASocket({
@@ -29,7 +31,7 @@ async function startWhatsApp() {
         generateHighQualityLinkPreview: false,
     });
 
-    // Handle credentials update (saves session so QR scan is one-time)
+    // Save credentials whenever they update (keeps session persistent)
     sock.ev.on('creds.update', saveCreds);
 
     // Handle connection updates
@@ -37,16 +39,16 @@ async function startWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('New QR Code generated. Visit /qr page to scan.');
+            console.log('New QR Code generated. Visit /qr to scan.');
             try {
                 qrCodeData = await qrcode.toDataURL(qr);
             } catch (err) {
-                console.error('Error generating QR Data URL:', err);
+                console.error('QR generation error:', err);
             }
         }
 
         if (connection === 'open') {
-            console.log('SUCCESS: WhatsApp connection is fully open and ready!');
+            console.log('SUCCESS: WhatsApp is fully connected and ready!');
             isReady = true;
             qrCodeData = '';
         }
@@ -56,21 +58,20 @@ async function startWhatsApp() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            console.warn('Connection closed. Status code:', statusCode);
+            console.warn('Connection closed. Code:', statusCode);
 
             if (shouldReconnect) {
-                console.log('Attempting to reconnect...');
-                await delay(3000);
-                startWhatsApp();
+                console.log('Reconnecting in 3 seconds...');
+                setTimeout(() => connectWhatsApp(), 3000);
             } else {
-                console.log('Device was logged out. Please re-scan QR code.');
+                console.log('Logged out. Re-scan QR code at /qr');
                 qrCodeData = '';
             }
         }
     });
 }
 
-// ─── Web Routes ───
+// ─── Routes ───
 
 app.get('/', (req, res) => {
     res.send(`
@@ -90,93 +91,74 @@ app.get('/qr', (req, res) => {
     if (isReady) {
         return res.send(`
             <div style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px;">
-                <h2 style="color: #075E54;">✅ WhatsApp Client is already connected!</h2>
+                <h2 style="color: #075E54;">✅ WhatsApp is already connected!</h2>
                 <p><a href="/">Go Back Home</a></p>
             </div>
         `);
     }
     res.send(`
         <div style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px;">
-            <h2 style="color: #128C7E;">Scan this QR code with your WhatsApp "Linked Devices"</h2>
-            <div id="qr-container" style="margin-top: 20px; min-height: 300px; display: flex; flex-direction: column; justify-content: center; align-items: center;">
-                <p id="loading-text">⏳ Generating QR Code... Please wait.</p>
-                <img id="qr-image" src="" alt="WhatsApp Web QR Code" style="border: 2px solid #333; padding: 10px; display: none; max-width: 300px;">
+            <h2 style="color: #128C7E;">Scan this QR code with WhatsApp → Linked Devices</h2>
+            <div id="qr-box" style="margin-top: 20px; min-height: 300px; display: flex; flex-direction: column; justify-content: center; align-items: center;">
+                <p id="msg">⏳ Generating QR Code... Please wait.</p>
+                <img id="qr" src="" alt="QR" style="border: 2px solid #333; padding: 10px; display: none; max-width: 300px;">
             </div>
-            <p style="color: #666; font-size: 14px; margin-top: 15px;">QR code updates automatically in real-time. Do NOT close this page.</p>
+            <p style="color: #666; font-size: 14px; margin-top: 15px;">QR updates automatically. Do NOT close this page.</p>
             <script>
-                const qrImage = document.getElementById('qr-image');
-                const loadingText = document.getElementById('loading-text');
-                let currentQr = '';
-
-                function checkStatus() {
-                    fetch('/api/status')
-                        .then(r => r.json())
-                        .then(data => {
-                            if (data.isReady) {
-                                window.location.href = '/';
-                                return;
-                            }
-                            if (data.qrCodeData && data.qrCodeData !== currentQr) {
-                                currentQr = data.qrCodeData;
-                                qrImage.src = currentQr;
-                                qrImage.style.display = 'block';
-                                loadingText.style.display = 'none';
-                            } else if (!data.qrCodeData) {
-                                qrImage.style.display = 'none';
-                                loadingText.style.display = 'block';
-                            }
-                        })
-                        .catch(err => console.error('Status check error:', err));
-                }
-
-                setInterval(checkStatus, 2000);
-                checkStatus();
+                const img = document.getElementById('qr');
+                const msg = document.getElementById('msg');
+                let prev = '';
+                setInterval(() => {
+                    fetch('/api/status').then(r => r.json()).then(d => {
+                        if (d.isReady) { window.location.href = '/'; return; }
+                        if (d.qrCodeData && d.qrCodeData !== prev) {
+                            prev = d.qrCodeData;
+                            img.src = prev;
+                            img.style.display = 'block';
+                            msg.style.display = 'none';
+                        }
+                    }).catch(() => {});
+                }, 2000);
             </script>
         </div>
     `);
 });
 
-// ─── API Endpoint to send WhatsApp message ───
+// ─── Send Message API ───
 
 app.post('/api/send', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    const expectedApiKey = process.env.API_KEY || 'Vikirthan@WhatsApp2026';
+    const expectedKey = process.env.API_KEY || 'Vikirthan@WhatsApp2026';
 
-    if (apiKey !== expectedApiKey) {
-        return res.status(403).json({ error: "Access Denied. Invalid API Key." });
+    if (apiKey !== expectedKey) {
+        return res.status(403).json({ error: 'Access Denied. Invalid API Key.' });
     }
-
     if (!isReady || !sock) {
-        return res.status(503).json({ error: "WhatsApp Client is not ready yet. Please link your account first via /qr page." });
+        return res.status(503).json({ error: 'WhatsApp not connected. Scan QR at /qr first.' });
     }
 
     const { phone, message } = req.body;
     if (!phone || !message) {
-        return res.status(400).json({ error: "Missing 'phone' or 'message' parameters in payload." });
+        return res.status(400).json({ error: "Missing 'phone' or 'message'." });
     }
 
-    // Sanitize phone number (remove non-digits)
     let cleanPhone = phone.replace(/\D/g, '');
-    if (cleanPhone.length === 10) {
-        cleanPhone = '91' + cleanPhone; // India default country prefix
-    }
+    if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone;
     const jid = cleanPhone + '@s.whatsapp.net';
 
     try {
         await sock.sendMessage(jid, { text: message });
-        console.log(`Successfully sent WhatsApp message to: ${cleanPhone}`);
-        res.json({ success: true, message: `WhatsApp message dispatched to ${cleanPhone}.` });
+        console.log(`Sent WhatsApp to: ${cleanPhone}`);
+        res.json({ success: true, message: `Message sent to ${cleanPhone}.` });
     } catch (err) {
-        console.error(`Failed to send WhatsApp message to ${cleanPhone}:`, err.message);
-        res.status(500).json({ error: `Failed to dispatch WhatsApp message: ${err.message}` });
+        console.error(`Failed to send to ${cleanPhone}:`, err.message);
+        res.status(500).json({ error: `Send failed: ${err.message}` });
     }
 });
 
-// ─── Start the server and WhatsApp client ───
+// ─── Start ───
 
 app.listen(PORT, () => {
     console.log(`WhatsApp microservice running on port ${PORT}`);
-    startWhatsApp().catch(err => {
-        console.error('Error starting WhatsApp client:', err.message);
-    });
+    connectWhatsApp().catch(err => console.error('Startup error:', err.message));
 });

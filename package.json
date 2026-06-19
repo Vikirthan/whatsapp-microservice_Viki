@@ -1,6 +1,7 @@
 {
   "name": "sreshta-whatsapp-microservice",
   "version": "2.0.0",
+  "type": "module",
   "description": "Lightweight WhatsApp Automation Microservice for Sreshta Nutri Mithai using Baileys (no Chromium)",
   "main": "index.js",
   "scripts": {
