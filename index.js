@@ -1,10 +1,9 @@
 import express from 'express';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode';
 import pino from 'pino';
 import dotenv from 'dotenv';
 import fs from 'fs';
-import path from 'path';
 
 dotenv.config();
 
@@ -18,27 +17,35 @@ let qrCodeData = '';
 let isReady = false;
 let sock = null;
 let retryCount = 0;
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 3;
 
 const logger = pino({ level: 'silent' });
 
-// Clear corrupted auth session
 function clearAuthState() {
-    console.log('Clearing auth state to start fresh...');
     try {
         if (fs.existsSync(AUTH_DIR)) {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-            console.log('Auth state cleared successfully.');
+            console.log('Auth state cleared.');
         }
     } catch (err) {
-        console.error('Error clearing auth state:', err.message);
+        console.error('Error clearing auth:', err.message);
     }
 }
 
 async function connectWhatsApp() {
+    // Fetch the latest WhatsApp Web version to avoid 405 errors
+    let version;
+    try {
+        const versionInfo = await fetchLatestBaileysVersion();
+        version = versionInfo.version;
+        console.log('Using WhatsApp Web version:', version);
+    } catch (err) {
+        console.warn('Could not fetch latest version, using default:', err.message);
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    sock = makeWASocket({
+    const socketConfig = {
         auth: state,
         logger,
         printQRInTerminal: false,
@@ -46,7 +53,14 @@ async function connectWhatsApp() {
         markOnlineOnConnect: false,
         syncFullHistory: false,
         generateHighQualityLinkPreview: false,
-    });
+    };
+
+    // Only add version if we successfully fetched it
+    if (version) {
+        socketConfig.version = version;
+    }
+
+    sock = makeWASocket(socketConfig);
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -54,17 +68,17 @@ async function connectWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('New QR Code generated. Visit /qr to scan.');
-            retryCount = 0; // Reset retry count when we get a fresh QR
+            console.log('QR Code generated. Visit /qr to scan.');
+            retryCount = 0;
             try {
                 qrCodeData = await qrcode.toDataURL(qr);
             } catch (err) {
-                console.error('QR generation error:', err);
+                console.error('QR error:', err);
             }
         }
 
         if (connection === 'open') {
-            console.log('SUCCESS: WhatsApp is fully connected and ready!');
+            console.log('SUCCESS: WhatsApp connected!');
             isReady = true;
             qrCodeData = '';
             retryCount = 0;
@@ -74,29 +88,43 @@ async function connectWhatsApp() {
             isReady = false;
             qrCodeData = '';
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            console.warn('Connection closed. Status code:', statusCode);
+            console.warn('Connection closed. Code:', statusCode);
 
-            // 401 = logged out, 405 = bad session/method not allowed
-            // For these, clear auth and start completely fresh
-            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
-                console.log('Session invalid (code ' + statusCode + '). Clearing auth and restarting...');
+            // Logged out — clear auth, start fresh
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                console.log('Logged out. Clearing auth...');
                 clearAuthState();
                 retryCount = 0;
-                setTimeout(() => connectWhatsApp(), 2000);
+                setTimeout(() => connectWhatsApp(), 3000);
                 return;
             }
 
-            // For other errors, retry with a limit
+            // 405 = version mismatch — clear auth AND re-fetch version
+            if (statusCode === 405) {
+                retryCount++;
+                if (retryCount <= MAX_RETRIES) {
+                    console.log(`Version mismatch (405). Clearing auth, retry ${retryCount}/${MAX_RETRIES}...`);
+                    clearAuthState();
+                    setTimeout(() => connectWhatsApp(), 5000);
+                } else {
+                    console.error('Max 405 retries reached. Waiting 60s before next attempt...');
+                    retryCount = 0;
+                    clearAuthState();
+                    setTimeout(() => connectWhatsApp(), 60000);
+                }
+                return;
+            }
+
+            // Other errors — reconnect with backoff
             retryCount++;
             if (retryCount <= MAX_RETRIES) {
-                const delay = Math.min(retryCount * 3000, 15000); // 3s, 6s, 9s, 12s, 15s
-                console.log(`Reconnecting in ${delay / 1000}s... (attempt ${retryCount}/${MAX_RETRIES})`);
-                setTimeout(() => connectWhatsApp(), delay);
+                const wait = Math.min(retryCount * 3000, 15000);
+                console.log(`Reconnecting in ${wait / 1000}s (attempt ${retryCount}/${MAX_RETRIES})...`);
+                setTimeout(() => connectWhatsApp(), wait);
             } else {
-                console.error(`Max retries (${MAX_RETRIES}) reached. Clearing auth and restarting fresh...`);
-                clearAuthState();
+                console.error('Max retries reached. Waiting 60s...');
                 retryCount = 0;
-                setTimeout(() => connectWhatsApp(), 5000);
+                setTimeout(() => connectWhatsApp(), 60000);
             }
         }
     });
@@ -122,7 +150,7 @@ app.get('/qr', (req, res) => {
     if (isReady) {
         return res.send(`
             <div style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px;">
-                <h2 style="color: #075E54;">✅ WhatsApp is already connected!</h2>
+                <h2 style="color: #075E54;">✅ WhatsApp is connected!</h2>
                 <p><a href="/">Go Back Home</a></p>
             </div>
         `);
@@ -155,34 +183,25 @@ app.get('/qr', (req, res) => {
     `);
 });
 
-// ─── Send Message API ───
-
 app.post('/api/send', async (req, res) => {
     const apiKey = req.headers['x-api-key'];
     const expectedKey = process.env.API_KEY || 'Vikirthan@WhatsApp2026';
 
-    if (apiKey !== expectedKey) {
-        return res.status(403).json({ error: 'Access Denied. Invalid API Key.' });
-    }
-    if (!isReady || !sock) {
-        return res.status(503).json({ error: 'WhatsApp not connected. Scan QR at /qr first.' });
-    }
+    if (apiKey !== expectedKey) return res.status(403).json({ error: 'Invalid API Key.' });
+    if (!isReady || !sock) return res.status(503).json({ error: 'WhatsApp not connected. Scan QR at /qr.' });
 
     const { phone, message } = req.body;
-    if (!phone || !message) {
-        return res.status(400).json({ error: "Missing 'phone' or 'message'." });
-    }
+    if (!phone || !message) return res.status(400).json({ error: "Missing 'phone' or 'message'." });
 
     let cleanPhone = phone.replace(/\D/g, '');
     if (cleanPhone.length === 10) cleanPhone = '91' + cleanPhone;
-    const jid = cleanPhone + '@s.whatsapp.net';
 
     try {
-        await sock.sendMessage(jid, { text: message });
-        console.log(`Sent WhatsApp to: ${cleanPhone}`);
-        res.json({ success: true, message: `Message sent to ${cleanPhone}.` });
+        await sock.sendMessage(cleanPhone + '@s.whatsapp.net', { text: message });
+        console.log(`Sent to: ${cleanPhone}`);
+        res.json({ success: true, message: `Sent to ${cleanPhone}.` });
     } catch (err) {
-        console.error(`Failed to send to ${cleanPhone}:`, err.message);
+        console.error(`Send failed (${cleanPhone}):`, err.message);
         res.status(500).json({ error: `Send failed: ${err.message}` });
     }
 });
@@ -190,6 +209,6 @@ app.post('/api/send', async (req, res) => {
 // ─── Start ───
 
 app.listen(PORT, () => {
-    console.log(`WhatsApp microservice running on port ${PORT}`);
+    console.log(`WhatsApp microservice on port ${PORT}`);
     connectWhatsApp().catch(err => console.error('Startup error:', err.message));
 });
