@@ -3,23 +3,40 @@ import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeys
 import qrcode from 'qrcode';
 import pino from 'pino';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5001;
+const AUTH_DIR = './auth_info';
 
 app.use(express.json());
 
 let qrCodeData = '';
 let isReady = false;
 let sock = null;
+let retryCount = 0;
+const MAX_RETRIES = 5;
 
-// Silent logger to reduce memory and noise
 const logger = pino({ level: 'silent' });
 
+// Clear corrupted auth session
+function clearAuthState() {
+    console.log('Clearing auth state to start fresh...');
+    try {
+        if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            console.log('Auth state cleared successfully.');
+        }
+    } catch (err) {
+        console.error('Error clearing auth state:', err.message);
+    }
+}
+
 async function connectWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     sock = makeWASocket({
         auth: state,
@@ -31,15 +48,14 @@ async function connectWhatsApp() {
         generateHighQualityLinkPreview: false,
     });
 
-    // Save credentials whenever they update (keeps session persistent)
     sock.ev.on('creds.update', saveCreds);
 
-    // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
             console.log('New QR Code generated. Visit /qr to scan.');
+            retryCount = 0; // Reset retry count when we get a fresh QR
             try {
                 qrCodeData = await qrcode.toDataURL(qr);
             } catch (err) {
@@ -51,21 +67,36 @@ async function connectWhatsApp() {
             console.log('SUCCESS: WhatsApp is fully connected and ready!');
             isReady = true;
             qrCodeData = '';
+            retryCount = 0;
         }
 
         if (connection === 'close') {
             isReady = false;
+            qrCodeData = '';
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.warn('Connection closed. Status code:', statusCode);
 
-            console.warn('Connection closed. Code:', statusCode);
+            // 401 = logged out, 405 = bad session/method not allowed
+            // For these, clear auth and start completely fresh
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 405) {
+                console.log('Session invalid (code ' + statusCode + '). Clearing auth and restarting...');
+                clearAuthState();
+                retryCount = 0;
+                setTimeout(() => connectWhatsApp(), 2000);
+                return;
+            }
 
-            if (shouldReconnect) {
-                console.log('Reconnecting in 3 seconds...');
-                setTimeout(() => connectWhatsApp(), 3000);
+            // For other errors, retry with a limit
+            retryCount++;
+            if (retryCount <= MAX_RETRIES) {
+                const delay = Math.min(retryCount * 3000, 15000); // 3s, 6s, 9s, 12s, 15s
+                console.log(`Reconnecting in ${delay / 1000}s... (attempt ${retryCount}/${MAX_RETRIES})`);
+                setTimeout(() => connectWhatsApp(), delay);
             } else {
-                console.log('Logged out. Re-scan QR code at /qr');
-                qrCodeData = '';
+                console.error(`Max retries (${MAX_RETRIES}) reached. Clearing auth and restarting fresh...`);
+                clearAuthState();
+                retryCount = 0;
+                setTimeout(() => connectWhatsApp(), 5000);
             }
         }
     });
