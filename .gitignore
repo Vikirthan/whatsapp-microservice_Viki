@@ -1,5 +1,4 @@
 node_modules/
 .env
-.wwebjs_auth/
-.wwebjs_cache/
+auth_info/
 .DS_Store
